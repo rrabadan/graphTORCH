@@ -3,14 +3,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch_geometric.loader import DataLoader
-from src.dataset import TorchDataset
-from src.model import GraphTORCHModel
+from graphtorch.dataset import TorchDataset
+from graphtorch.model import GraphTORCHModel
 from tqdm import tqdm
 import os
 
 def train():
     # Config
-    BATCH_SIZE = 1
+    BATCH_SIZE = 64
     HIDDEN_SIZE = 64
     LR = 1e-3
     EPOCHS = 5
