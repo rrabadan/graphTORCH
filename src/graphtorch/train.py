@@ -17,8 +17,11 @@ def train():
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Dataset
+    # InMemoryDataset automatically calls process() if files are missing
     dataset = TorchDataset(root='data')
-    dataset.process() # Ensure processed
+    
+    # Validation split check (optional)
+    print(f"Dataset loaded with {len(dataset)} events.")
     
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     
