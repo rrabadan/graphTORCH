@@ -2,16 +2,14 @@
 import uproot
 import torch
 import numpy as np
-import awkward as ak
 from torch_geometric.data import HeteroData, InMemoryDataset
-import os
 
 class TorchDataset(InMemoryDataset):
     def __init__(self, root, filename=None, treename=None, transform=None, pre_transform=None):
         self.filename = filename
         self.treenames = treename
         super().__init__(root, transform, pre_transform)
-        self.data, self.slices = torch.load(self.processed_paths[0])
+        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def raw_file_names(self):
@@ -26,41 +24,27 @@ class TorchDataset(InMemoryDataset):
         m_pion = 139.57018 # MeV/c^2
         c_speed = 299.792458 # mm/ns (vacuum speed of light)
         
-        if self.filename is None:
-            print("No filename provided, generating mock data...")
-            num_mock_events = 100
-            for i in range(num_mock_events):
-                # correct format for random data
-                num_tracks = np.random.randint(2, 10)
-                num_hits = np.random.randint(10, 50)
-                
-                # Random tracks: x, y, dx, dy, p, t0, pathlength, trackID
-                tracks_np = np.random.rand(num_tracks, 8)
-                # Random hits: x, y, t, trackID
-                hits_np = np.random.rand(num_hits, 4)
-                
-                data = self._build_event(tracks_np, hits_np, m_pion, c_speed)
-                data_list.append(data)
-        else:
-            with uproot.open(self.filename) as file:
-                tree = file[self.treenames] 
-                
-                # Read arrays
-                track_branches = ["xCoor", "yCoor", "xDir", "yDir", "momentum", "t0", "pathlength", "trackID"]
-                hit_branches = ["hitX", "hitY", "hitT", "hitTrackId"]
-                
-                # Load in chunks
-                for i, batch in enumerate(tree.iterate(track_branches + hit_branches, library="ak")):
-                    print(f"Processing chunk {i}")
-                    for j in range(len(batch)):
-                        event = batch[j]
-                        
-                        # Extract Data
-                        tracks_np = np.stack([event[b] for b in track_branches], axis=1)
-                        hits_np = np.stack([event[b] for b in hit_branches], axis=1)
-                        
-                        data = self._build_event(tracks_np, hits_np, m_pion, c_speed)
-                        data_list.append(data)
+        data_list = []
+        
+        with uproot.open(self.filename) as file:
+            tree = file[self.treenames] 
+            
+            # Read arrays
+            track_branches = ["xCoor", "yCoor", "xDir", "yDir", "momentum", "t0", "pathlength", "trackID"]
+            hit_branches = ["hitX", "hitY", "hitT", "hitTrackId"]
+            
+            # Load in chunks
+            for i, batch in enumerate(tree.iterate(track_branches + hit_branches, library="ak")):
+                print(f"Processing chunk {i}")
+                for j in range(len(batch)):
+                    event = batch[j]
+                    
+                    # Extract Data
+                    tracks_np = np.stack([event[b] for b in track_branches], axis=1)
+                    hits_np = np.stack([event[b] for b in hit_branches], axis=1)
+                    
+                    data = self._build_event(tracks_np, hits_np, m_pion, c_speed)
+                    data_list.append(data)
 
         if self.pre_filter is not None:
             data_list = [data for data in data_list if self.pre_filter(data)]
@@ -75,6 +59,22 @@ class TorchDataset(InMemoryDataset):
     def _build_event(self, tracks_np, hits_np, m_pion, c_speed):
         tracks = torch.tensor(tracks_np, dtype=torch.float)
         hits = torch.tensor(hits_np, dtype=torch.float)
+        
+        # Ensure 2D shape [Num, Features] even if 0 or 1 item
+        if tracks.dim() == 1 and tracks.numel() > 0:
+             # If it was a single track but flattened, finding out correct width is tricky if 0.
+             # But usually tracks_np comes from np.stack checks.
+             # Let's rely on reshaping if we know feature count.
+             # Track features: 8 (from track_branches)
+             tracks = tracks.view(-1, 8)
+        elif tracks.dim() == 1 and tracks.numel() == 0:
+             tracks = tracks.view(0, 8)
+
+        if hits.dim() == 1 and hits.numel() > 0:
+             # Hit features: 4 (from hit_branches)
+             hits = hits.view(-1, 4)
+        elif hits.dim() == 1 and hits.numel() == 0:
+             hits = hits.view(0, 4)
         
         num_tracks = tracks.shape[0]
         num_hits = hits.shape[0]
@@ -146,10 +146,7 @@ class TorchDataset(InMemoryDataset):
         return data
 
 
-
 if __name__ == "__main__":
     # Test
     # Note: This requires an actual file to work properly
     print("Please run this via train.py or ensure a root file exists.")
-    print(f"Dataset length: {len(dataset)}")
-    print(f"Sample data: {dataset[0]}")

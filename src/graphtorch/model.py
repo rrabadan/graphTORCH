@@ -50,26 +50,80 @@ class InteractionNetwork(nn.Module):
         
         return edge_logits
 
-class RelationalProcessor(MessagePassing):
+from torch_geometric.utils import scatter
+
+class RelationalProcessor(nn.Module):
     """
-    Current: 'Deep Set' / 'Relational Network' (No Aggregation)
-    Future:  Upgrade this class to perform Message Passing (GNN)
+    Bi-Directional Message Passing (Track <-> Hit).
+    Allows Hits to communicate via the Track hub.
     """
     def __init__(self, hidden_size):
-        super().__init__(aggr='add') # Aggr will be used in future updates
+        super().__init__()
         self.hidden_size = hidden_size
+        
+        # --- PASS 1: Track -> Hit ---
+        # Msg = MLP(h_track || h_edge)
+        self.msg_t2h = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        # Update Hit
+        self.update_hit = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        
+        # --- PASS 2: Hit -> Track (Backward) ---
+        # Msg = MLP(h_hit || h_edge)
+        self.msg_h2t = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
+        # Update Track
+        self.update_track = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size)
+        )
 
     def forward(self, h_track, h_hit, h_edge, edge_index):
-        # Unpack indices
         src, dst = edge_index
         
-        # In a full GNN, we would call self.propagate() here.
-        # For now, we manually construct the 'message' or 'relation'
-        # by concatenating the features of the connected nodes and the edge.
+        # --- STEP 1: Hit -> Track (Backward Flow first?) ---
+        # Usually good to let Tracks aggregate info from their candidates first.
+        # Flow: Hit(dst) -> Track(src)
         
-        # Construct edge representations: [h_track[src] || h_hit[dst] || h_edge]
-        # Shape: [num_edges, 3 * hidden_size]
-        edge_representation = torch.cat([h_track[src], h_hit[dst], h_edge], dim=1)
+        # Msg construction
+        msg_h2t = self.msg_h2t(torch.cat([h_hit[dst], h_edge], dim=1))
+        
+        # Aggregate at Source (Tracks)
+        # Note: edge_index[0] is src (tracks).
+        aggr_h2t = scatter(msg_h2t, src, dim=0, dim_size=h_track.size(0), reduce='add')
+        
+        # Update Tracks
+        h_track_updated = self.update_track(torch.cat([h_track, aggr_h2t], dim=1))
+        
+        
+        # --- STEP 2: Track -> Hit (Forward Flow) ---
+        # Now use the UPDATED track features to check overlap/compatibility
+        # Flow: Track(src) -> Hit(dst)
+        
+        # Msg construction (Using UPDATED tracks)
+        msg_t2h = self.msg_t2h(torch.cat([h_track_updated[src], h_edge], dim=1))
+        
+        # Aggregate at Target (Hits)
+        aggr_t2h = scatter(msg_t2h, dst, dim=0, dim_size=h_hit.size(0), reduce='add')
+        
+        # Update Hits
+        h_hit_updated = self.update_hit(torch.cat([h_hit, aggr_t2h], dim=1))
+        
+        
+        # --- STEP 3: Classify Edges ---
+        # Use UPDATED Track AND UPDATED Hit features
+        edge_representation = torch.cat([h_track_updated[src], h_hit_updated[dst], h_edge], dim=1)
         
         return edge_representation
 
