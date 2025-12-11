@@ -31,7 +31,7 @@ class InteractionNetwork(nn.Module):
         self.edge_classifier = nn.Sequential(
             nn.Linear(3 * hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, 1) # Logits
+            nn.Linear(hidden_size, 2) # Logits
         )
 
     def forward(self, x_track, x_hit, edge_index, edge_attr):
