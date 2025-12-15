@@ -15,6 +15,9 @@ dependencies = [
     "uproot>=5.6.8",
 ]
 
+[project.scripts]
+graphtorch-dataset = "graphtorch.dataset:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
