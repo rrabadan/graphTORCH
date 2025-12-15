@@ -30,8 +30,8 @@ class TorchDataset(InMemoryDataset):
             tree = file[self.treenames] 
             
             # Read arrays
-            track_branches = ["xCoor", "yCoor", "xDir", "yDir", "momentum", "t0", "pathlength", "trackID"]
-            hit_branches = ["hitX", "hitY", "hitT", "hitTrackId"]
+            track_branches = ["xCoor", "yCoor", "xDir", "yDir", "momentum", "t0", "pathlength", "trackId"]
+            hit_branches = ["hitX", "hitY", "hitT", "hitLocX", "hitLocY", "hitTrackId"]
             
             # Load in chunks
             for i, batch in enumerate(tree.iterate(track_branches + hit_branches, library="ak")):
@@ -65,16 +65,16 @@ class TorchDataset(InMemoryDataset):
              # If it was a single track but flattened, finding out correct width is tricky if 0.
              # But usually tracks_np comes from np.stack checks.
              # Let's rely on reshaping if we know feature count.
-             # Track features: 8 (from track_branches)
+             # Track columns: 8 (from track_branches)
              tracks = tracks.view(-1, 8)
         elif tracks.dim() == 1 and tracks.numel() == 0:
              tracks = tracks.view(0, 8)
 
         if hits.dim() == 1 and hits.numel() > 0:
-             # Hit features: 4 (from hit_branches)
-             hits = hits.view(-1, 4)
+             # Hit columns: 6 (from hit_branches)
+             hits = hits.view(-1, 6)
         elif hits.dim() == 1 and hits.numel() == 0:
-             hits = hits.view(0, 4)
+             hits = hits.view(0, 6)
         
         num_tracks = tracks.shape[0]
         num_hits = hits.shape[0]
@@ -126,14 +126,27 @@ class TorchDataset(InMemoryDataset):
         tof = pathlength / (c_speed * beta)
 
         delta_t = hit_t - (t0 + tof)
+
+        # Delta X/Y
+        track_x = tracks[track_indices, 0]
+        track_y = tracks[track_indices, 1]
+        hit_x = hits[hit_indices, 3]
+        hit_y = hits[hit_indices, 4]
+
+        delta_x = hit_x - track_x
+        delta_y = hit_y - track_y
         
         # Edge Feature Scaling
-        # Let's scale by 20
-        edge_attr = (delta_t / 20.0).view(-1, 1)
+        # Let's scale to [-1, -1]
+        edge_attr_t = (delta_t / 50.0).view(-1, 1)
+        edge_attr_x = (delta_x / 330.0).view(-1, 1)
+        edge_attr_y = (delta_y / 1250.0).view(-1, 1)
+
+        edge_attr = torch.cat([edge_attr_t, edge_attr_x, edge_attr_y], dim=1)
         
         # Labels
         track_ids = tracks[track_indices, 7]
-        hit_track_ids = hits[hit_indices, 3]
+        hit_track_ids = hits[hit_indices, 5]
         edge_label = (track_ids == hit_track_ids).float().view(-1)
         
         data = HeteroData()
@@ -146,7 +159,18 @@ class TorchDataset(InMemoryDataset):
         return data
 
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Process Root file into TorchDataset')
+    parser.add_argument('--root_dir', type=str, required=True, help='Root directory for the dataset (where "processed" folder works)')
+    parser.add_argument('--input_file', type=str, required=True, help='Path to the input ROOT file')
+    parser.add_argument('--tree_name', type=str, default='events', help='Name of the tree in the ROOT file')
+    
+    args = parser.parse_args()
+    
+    print(f"Creating/Loading dataset in {args.root_dir} from {args.input_file} (Tree: {args.tree_name})")
+    dataset = TorchDataset(root=args.root_dir, filename=args.input_file, treename=args.tree_name)
+    print(f"Dataset ready. Size: {len(dataset)}")
+
 if __name__ == "__main__":
-    # Test
-    # Note: This requires an actual file to work properly
-    print("Please run this via train.py or ensure a root file exists.")
+    main()
