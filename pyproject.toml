@@ -17,6 +17,8 @@ dependencies = [
 
 [project.scripts]
 graphtorch-dataset = "graphtorch.dataset:main"
+graphtorch-train = "graphtorch.train:main"
+graphtorch-evaluate = "graphtorch.evaluate:main"
 
 [build-system]
 requires = ["hatchling"]
