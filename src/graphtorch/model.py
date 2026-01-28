@@ -1,90 +1,106 @@
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import scatter
 
 class InteractionNetwork(nn.Module):
     def __init__(self, node_features_track, node_features_hit, edge_features, hidden_size):
         super().__init__()
         
-        # 1. Encoders: Embed raw inputs into latent space
+        # --- 1. Encoders ---
+        # These project Physics quantities into the Latent Space.
+        # node_features_track = 6 (x, y, tx, ty, p, t0)
+        # node_features_hit = 3 (x, y, t)
+        # edge_features = 3 (dt, dx, dy)
+        
         self.track_encoder = nn.Sequential(
             nn.Linear(node_features_track, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()  # Added extra non-linearity
         )
+        
         self.hit_encoder = nn.Sequential(
             nn.Linear(node_features_hit, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()
         )
+        
         self.edge_encoder = nn.Sequential(
             nn.Linear(edge_features, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU()
         )
         
-        # 2. Processor: The core interaction/graph logic
+        # --- 2. Processor ---
         self.processor = RelationalProcessor(hidden_size)
         
-        # 3. Edge Decoder: Classifies edges based on processed latent features
-        # Input size is 3 * hidden_size because we concat (track + hit + edge)
+        # --- 3. Edge Decoder ---
+        # Classifies the edge based on the final latent representation.
+        # Input: [Updated Track (Hidden) + Updated Hit (Hidden) + Edge (Hidden)]
         self.edge_classifier = nn.Sequential(
             nn.Linear(3 * hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, 2) # Logits
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1) # Output 1 score (Logit) for BCEWithLogitsLoss
         )
 
     def forward(self, x_track, x_hit, edge_index, edge_attr):
-        # 1. Encode
+        # 1. Encode Raw Physics Data -> Latent Space
         h_track = self.track_encoder(x_track)
         h_hit = self.hit_encoder(x_hit)
         h_edge = self.edge_encoder(edge_attr)
         
-        # 2. Process
-        # Currently this returns the concatenated features (Deep Set style)
-        # In future GNN updates, this will return updated latent features after message passing
-        latent_edge_features = self.processor(h_track, h_hit, h_edge, edge_index)
+        # 2. Process Graph (Message Passing)
+        # Returns: Tensor of shape [num_edges, 3 * hidden_size]
+        edge_latent_features = self.processor(h_track, h_hit, h_edge, edge_index)
         
-        # 3. Decode
-        edge_logits = self.edge_classifier(latent_edge_features)
+        # 3. Decode -> Classification Score
+        edge_logits = self.edge_classifier(edge_latent_features)
         
         return edge_logits
 
-from torch_geometric.utils import scatter
 
 class RelationalProcessor(nn.Module):
     """
-    Bi-Directional Message Passing (Track <-> Hit).
-    Allows Hits to communicate via the Track hub.
+    Interaction Network Processor.
+    'Pair-Aware' Message Passing.
+    
+    The network computes a latent 'Interaction Representation' for every 
+    Track-Hit pair BEFORE aggregation. This aims at allowing the model to learn 
+    the optical transfer function (Track -> Optical Path -> Hit) explicitly 
+    at the edge level.
     """
     def __init__(self, hidden_size):
         super().__init__()
-        self.hidden_size = hidden_size
         
-        # --- PASS 1: Track -> Hit ---
-        # Msg = MLP(h_track || h_edge)
-        self.msg_t2h = nn.Sequential(
-            nn.Linear(2 * hidden_size, hidden_size),
+        # 1. The "Interaction" Learner (Edge Block)
+        # Input: Track + Hit + Edge
+        # Logic: f(Track, Hit, Edge) -> Latent Interaction
+        # This MLP aims at learning: "Is this specific Hit consistent with this specific Track?"
+        self.edge_updater = nn.Sequential(
+            nn.Linear(3 * hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
-        )
-        # Update Hit
-        self.update_hit = nn.Sequential(
-            nn.Linear(2 * hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size)
+            nn.Linear(hidden_size, hidden_size) 
         )
         
-        # --- PASS 2: Hit -> Track (Backward) ---
-        # Msg = MLP(h_hit || h_edge)
-        self.msg_h2t = nn.Sequential(
-            nn.Linear(2 * hidden_size, hidden_size),
+        # 2. Track Updater (Node Block)
+        # Aggregates interactions to update Track belief
+        self.track_updater = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size), # [Old Track || Aggr Message]
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size)
         )
-        # Update Track
-        self.update_track = nn.Sequential(
-            nn.Linear(2 * hidden_size, hidden_size),
+        
+        # 3. Hit Updater (Node Block)
+        # Aggregates interactions to update Hit belief
+        self.hit_updater = nn.Sequential(
+            nn.Linear(2 * hidden_size, hidden_size), # [Old Hit || Aggr Message]
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size)
         )
@@ -92,40 +108,45 @@ class RelationalProcessor(nn.Module):
     def forward(self, h_track, h_hit, h_edge, edge_index):
         src, dst = edge_index
         
-        # --- STEP 1: Hit -> Track (Backward Flow first?) ---
-        # Usually good to let Tracks aggregate info from their candidates first.
-        # Flow: Hit(dst) -> Track(src)
+        # --- STEP 1: Compute Interactions (The "Optical" Check) ---
+        # Concatenate features for every pair: [Track_i || Hit_j || Edge_ij]
+        # This places the Track kinematics and Hit position in the same vector
+        # allowing the MLP to learn the non-linear relationship between them.
+        pair_features = torch.cat([h_track[src], h_hit[dst], h_edge], dim=1)
         
-        # Msg construction
-        msg_h2t = self.msg_h2t(torch.cat([h_hit[dst], h_edge], dim=1))
-        
-        # Aggregate at Source (Tracks)
-        # Note: edge_index[0] is src (tracks).
-        aggr_h2t = scatter(msg_h2t, src, dim=0, dim_size=h_track.size(0), reduce='add')
-        
-        # Update Tracks
-        h_track_updated = self.update_track(torch.cat([h_track, aggr_h2t], dim=1))
+        # Compute latent edge features (Messages)
+        # Shape: [num_edges, hidden_size]
+        h_interaction = self.edge_updater(pair_features)
         
         
-        # --- STEP 2: Track -> Hit (Forward Flow) ---
-        # Now use the UPDATED track features to check overlap/compatibility
-        # Flow: Track(src) -> Hit(dst)
+        # --- STEP 2: Aggregation (Message Passing) ---
         
-        # Msg construction (Using UPDATED tracks)
-        msg_t2h = self.msg_t2h(torch.cat([h_track_updated[src], h_edge], dim=1))
+        # Track Aggregation: Sum up all interactions for each Track
+        # "How many valid hits did I find? What is the total signal?"
+        # src is the Track index
+        aggr_to_track = scatter(h_interaction, src, dim=0, dim_size=h_track.size(0), reduce='add')
         
-        # Aggregate at Target (Hits)
-        aggr_t2h = scatter(msg_t2h, dst, dim=0, dim_size=h_hit.size(0), reduce='add')
+        # Hit Aggregation: Sum up all interactions for each Hit
+        # "How many tracks claim me?" (Helps resolve ambiguity if tracks overlap)
+        # dst is the Hit index
+        aggr_to_hit = scatter(h_interaction, dst, dim=0, dim_size=h_hit.size(0), reduce='add')
         
-        # Update Hits
-        h_hit_updated = self.update_hit(torch.cat([h_hit, aggr_t2h], dim=1))
+        
+        # --- STEP 3: State Updates ---
+        
+        # Update Tracks with the aggregated info
+        h_track_updated = self.track_updater(torch.cat([h_track, aggr_to_track], dim=1))
+        
+        # Update Hits with the aggregated info
+        h_hit_updated = self.hit_updater(torch.cat([h_hit, aggr_to_hit], dim=1))
         
         
-        # --- STEP 3: Classify Edges ---
-        # Use UPDATED Track AND UPDATED Hit features
-        edge_representation = torch.cat([h_track_updated[src], h_hit_updated[dst], h_edge], dim=1)
+        # --- STEP 4: Return Context for Final Classification ---
+        # We re-construct the pair representation using the UPDATED node features.
+        # This gives the final classifier the most refined information.
+        final_edge_representation = torch.cat([h_track_updated[src], h_hit_updated[dst], h_edge], dim=1)
         
-        return edge_representation
+        return final_edge_representation
 
 # Basic model wrapper for HeteroData
 class GraphTORCHModel(nn.Module):
@@ -133,8 +154,8 @@ class GraphTORCHModel(nn.Module):
         super().__init__()
         # Track: [x, y, dx, dy, p, t0] -> 6
         # Hit: [x, y, t] -> 3
-        # Edge: [delta_t] -> 1
-        self.model = InteractionNetwork(6, 3, 1, hidden_size)
+        # Edge: [dt, dx, dy] -> 3
+        self.model = InteractionNetwork(6, 3, 3, hidden_size)
         
     def forward(self, data):
         # Unpack HeteroData
