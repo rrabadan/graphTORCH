@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score
 from torch_geometric.loader import DataLoader
 from graphtorch.dataset import TorchDataset
 from graphtorch.model import GraphTORCHModel
@@ -10,27 +10,24 @@ from tqdm import tqdm
 import os
 import numpy as np
 
-def train():
+def train(input_file, epochs, batch_size=64, hidden_size=64, lr=1e-3, root_dir='data'):
     # Config
-    BATCH_SIZE = 64
-    HIDDEN_SIZE = 64
-    LR = 1e-3
-    EPOCHS = 10
+    BATCH_SIZE = batch_size
+    HIDDEN_SIZE = hidden_size
+    LR = lr
+    EPOCHS = epochs
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Dataset
-    # InMemoryDataset automatically calls process() if files are missing
-    dataset = TorchDataset(root='data')
-    
-    # Validation split check    # Dataset
-    # Assuming you want to load the processed data from 'data' dir (or specify filename if reprocessing needed)
+    # Assuming loading the processed data from 'data' dir (or specify filename if reprocessing needed)
     # If processing is already done (data.pt exists), filename arg is ignored by InMemoryDataset logic usually,
-    # but we pass it just in case.
-    dataset = TorchDataset(root='data', filename='data/gnn-inputs-train.root', treename='filteredHits')
+    # but pass it just in case.
+    dataset = TorchDataset(root=root_dir, filename=input_file, treename='events')
     # Force process if needed or just load
     # dataset.process() 
     
     # Shuffle and Split
+    torch.manual_seed(42)
     dataset = dataset.shuffle()
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -50,7 +47,7 @@ def train():
     # Handle Class Imbalance
     # Calculate ratio of neg/pos edges from a sample or estimate
     # We can iterate the training set once or just estimate. 
-    # Let's verify quickly from the first batch.
+    # Verify quickly from the first batch.
     print("Calculating class weight from first batch...")
     sample_batch = next(iter(train_loader))
     num_pos = sample_batch['track', 'to', 'hit'].y.sum()
@@ -94,6 +91,7 @@ def train():
         
         # Accumulate for Sklearn
         all_preds = []
+        all_probs = []
         all_labels = []
         
         with torch.no_grad():
@@ -109,23 +107,51 @@ def train():
                 preds = (probs > 0.5).float()
                 
                 all_preds.append(preds.cpu().numpy())
+                all_probs.append(probs.cpu().numpy())
                 all_labels.append(labels.cpu().numpy())
         
         # Compute Epoch Metrics
-        all_preds = np.concatenate(all_preds)
+        all_preds = np.concatenate(all_preds) # This is 0.5 threshold
+        all_probs = np.concatenate(all_probs)
         all_labels = np.concatenate(all_labels)
         
         avg_val_loss = val_loss / len(val_loader)
-        precision = precision_score(all_labels, all_preds, zero_division=0)
-        recall = recall_score(all_labels, all_preds, zero_division=0)
-        f1 = f1_score(all_labels, all_preds, zero_division=0)
-
-        print(f"Epoch {epoch+1} | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Purity: {precision:.4f} | Eff: {recall:.4f} | F1: {f1:.4f}")
+        auc = roc_auc_score(all_labels, all_probs)
+        
+        print(f"Epoch {epoch+1} | Loss: {avg_val_loss:.4f} | AUC: {auc:.4f}")
+        
+        # Check multiple thresholds
+        thresholds = [0.5, 0.8, 0.95]
+        for thresh in thresholds:
+            preds_t = (all_probs > thresh).astype(float)
+            purity = precision_score(all_labels, preds_t, zero_division=0)
+            eff = recall_score(all_labels, preds_t, zero_division=0)
+            f1 = f1_score(all_labels, preds_t, zero_division=0)
+            print(f"  > Thresh {thresh:.2f} | Purity: {purity:.4f} | Eff: {eff:.4f} | F1: {f1:.4f}")
         
     # Save Model
     os.makedirs('models', exist_ok=True)
     torch.save(model.state_dict(), 'models/graphtorch_model.pth')
     print("Model saved.")
 
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Train GraphTORCH Model')
+    parser.add_argument('--input_file', type=str, required=True, help='Path to input ROOT file')
+    parser.add_argument('--epochs', type=int, required=True, help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size (default: 64)')
+    parser.add_argument('--hidden_size', type=int, default=64, help='Hidden layer size (default: 64)')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate (default: 1e-3)')
+    parser.add_argument('--root_dir', type=str, default='data', help='Data root directory (default: data)')
+    
+    args = parser.parse_args()
+    
+    train(input_file=args.input_file, 
+          epochs=args.epochs,
+          batch_size=args.batch_size,
+          hidden_size=args.hidden_size,
+          lr=args.lr,
+          root_dir=args.root_dir)
+
 if __name__ == "__main__":
-    train()
+    main()
